@@ -10,13 +10,23 @@ This script handles common workshop scenarios:
 - Billing account propagation delays (when credits are just claimed)
 - Verification that billing link is actually active
 
+Selection heuristic (when multiple accounts exist):
+  1. Prefer account already tagged with our suffix (from a previous run)
+  2. Prefer account not yet linked to any project (freshest)
+  3. Fall back to first open account
+
+After selection, the account is tagged with a date suffix (e.g. -202602181530)
+so subsequent runs can identify it.
+
 Usage: Called by setup.sh, or run directly: python3 billing-enablement.py
 """
 
 import os
+import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 try:
     from google.cloud import billing_v1
@@ -29,6 +39,10 @@ except ImportError:
     ])
     from google.cloud import billing_v1
     from google.api_core import exceptions
+
+
+# Pattern to detect our date suffix (e.g., "-202602181530")
+SUFFIX_PATTERN = re.compile(r'-\d{12}$')
 
 
 def get_project_id() -> str:
@@ -102,6 +116,98 @@ def check_current_billing(client: billing_v1.CloudBillingClient, project_id: str
         return False, None
     except Exception:
         return False, None
+
+
+def get_linked_project_count(client: billing_v1.CloudBillingClient, billing_account) -> int:
+    """Count the number of projects linked to a billing account.
+    
+    Returns 0 if the account has no linked projects (freshest account),
+    or -1 if the check fails (treat as unknown).
+    """
+    try:
+        projects = client.list_project_billing_info(name=billing_account.name)
+        count = 0
+        for _ in projects:
+            count += 1
+            if count > 0:
+                # We only need to know if there's at least one; stop early
+                break
+        return count
+    except Exception:
+        # If we can't check, return -1 (unknown — don't penalize this account)
+        return -1
+
+
+def find_best_billing_account(client: billing_v1.CloudBillingClient, 
+                               open_accounts: list) -> object:
+    """Select the best billing account using our heuristic.
+    
+    Priority (designed for multi-day workshops where new credits are redeemed daily):
+      1. Account not yet linked to any project (freshest — e.g. day 2 credits)
+      2. Account with our suffix, preferring the newest suffix date
+      3. First open account (fallback)
+    """
+    # Priority 1: Find account with no linked projects (freshest)
+    unlinked_accounts = []
+    for account in open_accounts:
+        linked_count = get_linked_project_count(client, account)
+        if linked_count == 0:
+            unlinked_accounts.append(account)
+    
+    if unlinked_accounts:
+        account = unlinked_accounts[0]
+        print(f"   Selected unlinked (fresh) account: {account.display_name}")
+        return account
+    
+    # Priority 2: Among tagged accounts, pick the one with the newest suffix
+    tagged_accounts = []
+    for account in open_accounts:
+        match = SUFFIX_PATTERN.search(account.display_name)
+        if match:
+            tagged_accounts.append((account, match.group()))
+    
+    if tagged_accounts:
+        # Sort by suffix descending (newest date first)
+        tagged_accounts.sort(key=lambda x: x[1], reverse=True)
+        account = tagged_accounts[0][0]
+        print(f"   Selected newest tagged account: {account.display_name}")
+        return account
+    
+    # Priority 3: Fallback to first account
+    account = open_accounts[0]
+    print(f"   No unlinked or tagged accounts. Using: {account.display_name}")
+    return account
+
+
+def tag_billing_account(client: billing_v1.CloudBillingClient, account) -> None:
+    """Tag billing account with date suffix for future identification.
+    
+    Appends a suffix like '-202602181530' to the display name.
+    Silently skips if permission denied (requires billing.accounts.update).
+    """
+    # Don't double-tag
+    if SUFFIX_PATTERN.search(account.display_name):
+        return
+    
+    suffix = datetime.now().strftime("-%Y%m%d%H%M")
+    new_name = f"{account.display_name}{suffix}"
+    
+    try:
+        update_request = billing_v1.UpdateBillingAccountRequest(
+            name=account.name,
+            account=billing_v1.BillingAccount(
+                display_name=new_name
+            ),
+            update_mask={"paths": ["display_name"]}
+        )
+        client.update_billing_account(request=update_request)
+        print(f"   ✓ Tagged account as: {new_name}")
+    except exceptions.PermissionDenied:
+        # User doesn't have billing.accounts.update — that's OK
+        print(f"   ℹ  Could not tag account (insufficient permissions — this is OK)")
+    except Exception as e:
+        # Non-fatal — tagging is a convenience, not a requirement
+        print(f"   ℹ  Could not tag account: {e}")
 
 
 def link_billing_account(client: billing_v1.CloudBillingClient, project_id: str, 
@@ -236,16 +342,17 @@ def main():
             account = open_accounts[0]
             print(f"   Found: {account.display_name}")
             if link_billing_account(billing_client, project_id, account):
+                tag_billing_account(billing_client, account)
                 print("✓ Billing configured successfully")
                 return 0
             return 1
         
-        # Multiple accounts - auto-select the first one (matches levels 2-5 behavior)
-        # Only fall back to manual selection if the auto-selected account fails
-        account = open_accounts[0]
+        # Multiple accounts — use smart selection heuristic
         print(f"   Found {len(open_accounts)} billing accounts")
+        account = find_best_billing_account(billing_client, open_accounts)
         print(f"   Auto-selecting: {account.display_name}")
         if link_billing_account(billing_client, project_id, account):
+            tag_billing_account(billing_client, account)
             print("✓ Billing configured successfully")
             return 0
         
@@ -269,6 +376,7 @@ def main():
         
         account = open_accounts[index]
         if link_billing_account(billing_client, project_id, account):
+            tag_billing_account(billing_client, account)
             print("✓ Billing configured successfully")
             return 0
         return 1

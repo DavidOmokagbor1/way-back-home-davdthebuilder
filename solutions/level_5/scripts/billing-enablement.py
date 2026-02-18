@@ -1,8 +1,14 @@
 import os
+import re
 import subprocess
 import time
+from datetime import datetime
 from google.cloud import billing_v1
 from google.api_core import exceptions
+
+# Pattern to detect our date suffix (e.g., "-202602181530")
+SUFFIX_PATTERN = re.compile(r'-\d{12}$')
+
 
 # --- No changes to the functions in this section ---
 
@@ -59,6 +65,93 @@ def get_billing_accounts(client):
     except Exception as e:
         print(f"\nAn unexpected error occurred while fetching accounts: {e}")
         return "UNEXPECTED_ERROR"
+
+
+def get_linked_project_count(client, billing_account):
+    """Count the number of projects linked to a billing account.
+    
+    Returns 0 if the account has no linked projects (freshest account),
+    or -1 if the check fails (treat as unknown).
+    """
+    try:
+        projects = client.list_project_billing_info(name=billing_account.name)
+        count = 0
+        for _ in projects:
+            count += 1
+            if count > 0:
+                break  # Only need to know if there's at least one
+        return count
+    except Exception:
+        return -1
+
+
+def find_best_billing_account(client, open_accounts):
+    """Select the best billing account using our heuristic.
+    
+    Priority (designed for multi-day workshops where new credits are redeemed daily):
+      1. Account not yet linked to any project (freshest — e.g. day 2 credits)
+      2. Account with our suffix, preferring the newest suffix date
+      3. First open account (fallback)
+    """
+    # Priority 1: Find account with no linked projects (freshest)
+    unlinked_accounts = []
+    for account in open_accounts:
+        linked_count = get_linked_project_count(client, account)
+        if linked_count == 0:
+            unlinked_accounts.append(account)
+    
+    if unlinked_accounts:
+        account = unlinked_accounts[0]
+        print(f"Selected unlinked (fresh) account: {account.display_name}")
+        return account
+    
+    # Priority 2: Among tagged accounts, pick the one with the newest suffix
+    tagged_accounts = []
+    for account in open_accounts:
+        match = SUFFIX_PATTERN.search(account.display_name)
+        if match:
+            tagged_accounts.append((account, match.group()))
+    
+    if tagged_accounts:
+        # Sort by suffix descending (newest date first)
+        tagged_accounts.sort(key=lambda x: x[1], reverse=True)
+        account = tagged_accounts[0][0]
+        print(f"Selected newest tagged account: {account.display_name}")
+        return account
+    
+    # Priority 3: Fallback to first account
+    account = open_accounts[0]
+    print(f"No unlinked or tagged accounts. Using: {account.display_name}")
+    return account
+
+
+def tag_billing_account(client, account):
+    """Tag billing account with date suffix for future identification.
+    
+    Appends a suffix like '-202602181530' to the display name.
+    Silently skips if permission denied (requires billing.accounts.update).
+    """
+    if SUFFIX_PATTERN.search(account.display_name):
+        return  # Already tagged
+    
+    suffix = datetime.now().strftime("-%Y%m%d%H%M")
+    new_name = f"{account.display_name}{suffix}"
+    
+    try:
+        update_request = billing_v1.UpdateBillingAccountRequest(
+            name=account.name,
+            account=billing_v1.BillingAccount(
+                display_name=new_name
+            ),
+            update_mask={"paths": ["display_name"]}
+        )
+        client.update_billing_account(request=update_request)
+        print(f"Tagged account as: {new_name}")
+    except exceptions.PermissionDenied:
+        print(f"Could not tag account (insufficient permissions — this is OK)")
+    except Exception as e:
+        print(f"Could not tag account: {e}")
+
 
 def link_project_to_billing(client, target_project_id, billing_account_info):
     """Links a project and then verifies that the link is active."""
@@ -162,11 +255,18 @@ if __name__ == "__main__":
                 open_accounts = [acc for acc in accounts_result if acc.open]
                 if not open_accounts:
                     print("\nFound billing accounts, but none are currently open.")
-                else:
+                elif len(open_accounts) == 1:
                     target_account = open_accounts[0]
-                    print("\n--- Found Active Billing Accounts ---")
-                    print(f"Selected the first open account as the target: '{target_account.display_name}'")
+                    print(f"\n--- Found 1 Active Billing Account ---")
+                    print(f"Using: '{target_account.display_name}'")
                     link_project_to_billing(billing_client, project_id, target_account)
+                    tag_billing_account(billing_client, target_account)
+                else:
+                    print(f"\n--- Found {len(open_accounts)} Active Billing Accounts ---")
+                    target_account = find_best_billing_account(billing_client, open_accounts)
+                    print(f"Auto-selecting: '{target_account.display_name}'")
+                    link_project_to_billing(billing_client, project_id, target_account)
+                    tag_billing_account(billing_client, target_account)
 
         elif accounts_result == "API_DISABLED_OR_NO_PERMISSION":
             print("\nScript finished with an unrecoverable error: The Billing API did not become active or you have a permissions issue.")
