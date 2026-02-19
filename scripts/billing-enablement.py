@@ -155,6 +155,12 @@ def find_best_billing_account(client: billing_v1.CloudBillingClient,
             unlinked_accounts.append(account)
     
     if unlinked_accounts:
+        # Among unlinked, prefer accounts with "trial billing account" in the name
+        # (workshop credits typically use this naming convention)
+        unlinked_accounts.sort(
+            key=lambda a: "trial billing account" in a.display_name.lower(),
+            reverse=True
+        )
         account = unlinked_accounts[0]
         print(f"   Selected unlinked (fresh) account: {account.display_name}")
         return account
