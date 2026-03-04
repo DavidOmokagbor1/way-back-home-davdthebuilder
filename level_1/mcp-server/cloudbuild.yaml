@@ -45,7 +45,7 @@ steps:
       - '--set-env-vars'
       - 'GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=${_REGION}'
       - '--labels'
-      - 'app=way-back-home,level=1,component=mcp-server'
+      - 'app=way-back-home,level=1,component=mcp-server,dev-tutorial=multi-modal'
 
 substitutions:
   _REGION: us-central1
